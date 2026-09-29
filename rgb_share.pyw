@@ -261,6 +261,23 @@ def save_json(path, data):
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def openrgb_log_issues(limit=20):
+    """讀取 OpenRGB 最新記錄檔中的錯誤與警告（例如某個裝置初始化失敗）"""
+    logs = Path(os.environ.get("APPDATA", "")) / "OpenRGB" / "logs"
+    try:
+        latest = max(logs.glob("OpenRGB_*.log"), key=lambda f: f.stat().st_mtime)
+        text = latest.read_text(encoding="utf-8", errors="replace").splitlines()
+    except (OSError, ValueError):
+        return []
+    out = []
+    for line in text:
+        if ("[Error" in line or "[Warning" in line) and "NetworkServer" not in line:
+            line = re.sub(r"^\[\s*\d+\s*\]", "", line).strip()
+            if line not in out:
+                out.append(line)
+    return out[-limit:]
+
+
 # ---------------------------------------------------------------- 硬體偵測
 def detect_hardware():
     script = r"""
@@ -285,12 +302,19 @@ $keys = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
 $r.software = @(Get-ItemProperty $keys -ErrorAction SilentlyContinue |
     Where-Object { $_.DisplayName -match '__PATTERN__' -and $_.DisplayName -notmatch 'HAL$|Component$|add-on|SDK$|Driver' } |
     ForEach-Object { $_.DisplayName } | Sort-Object -Unique)
+$r.usb = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+    Where-Object { $_.InstanceId -match '^(USB|HID)\\VID_([0-9A-F]{4})&PID_([0-9A-F]{4})' } |
+    ForEach-Object { [pscustomobject]@{ id = ($Matches[2] + ':' + $Matches[3]); name = $_.FriendlyName } } |
+    Where-Object { $_.id -notmatch '^(8087|1D6B|0BDA|8086|1022):' } |
+    Group-Object id | ForEach-Object {
+        $names = @($_.Group | ForEach-Object { $_.name } | Where-Object { $_ } | Sort-Object -Unique)
+        $_.Name + '  ' + ($names -join ' / ') })
 $os = Get-CimInstance Win32_OperatingSystem
 $r.os = "$($os.Caption) $($os.Version)"
 $r | ConvertTo-Json -Depth 3 -Compress
 """.replace("__PATTERN__", RGB_SOFTWARE_PATTERN)
     data = run_powershell_json(script) or {}
-    for k in ("gpu", "ram", "disk", "peripherals", "software"):
+    for k in ("gpu", "ram", "disk", "peripherals", "software", "usb"):
         v = data.get(k)
         if v is None:
             data[k] = []
@@ -357,6 +381,7 @@ class RGBController:
         self.server_proc = None
         self.state = load_json(STATE_FILE, {})
         self.lock = threading.RLock()
+        self.last_results = {}  # 最近一次操作的結果，放進診斷報告
 
     def device_count(self):
         """重新讀取裝置清單並回傳數量"""
@@ -450,8 +475,18 @@ class RGBController:
         save_json(STATE_FILE, self.state)
 
     def turn_off(self, dev):
+        """關燈並回傳預期結果（給事後檢查用）"""
         with self.lock:
-            self._turn_off(dev)
+            before = dev.modes[dev.active_mode].name
+            try:
+                expect = self._turn_off(dev)
+            except Exception as e:  # noqa: BLE001
+                log(f"關閉失敗 {dev.name}：原模式 {before}，可用模式 {[m.name for m in dev.modes]}，錯誤 {e}")
+                raise
+            log(f"關閉 {dev.name}：{before} → {expect['mode']}"
+                f"{'（黑色）' if expect['black'] else ''}，裝置回報 {dev.modes[dev.active_mode].name}")
+            self.last_results[self.key(dev)] = f"{before} → {expect['mode']}{'（黑色）' if expect['black'] else ''}"
+            return expect
 
     def _turn_off(self, dev):
         k = self.key(dev)
@@ -470,19 +505,54 @@ class RGBController:
         off_mode = next((m for m in dev.modes if m.name.lower() in ("off", "關閉", "disable", "disabled")), None)
         if off_mode is not None:
             dev.set_mode(off_mode)
-            return
+            return {"mode": off_mode.name, "black": False}
         try:
             dev.set_custom_mode()  # 通常是 Direct 模式
             dev.set_color(BLACK)
-            return
+            return {"mode": dev.modes[dev.active_mode].name, "black": True}
         except Exception as e:  # noqa: BLE001
             log(f"{dev.name} custom mode 失敗：{e}")
         static = next((m for m in dev.modes if m.name.lower() == "static"), None)
         if static is not None:
-            dev.set_mode(static)
+            if getattr(static, "brightness", None) is not None and static.brightness_min is not None:
+                static.brightness = static.brightness_min
+            if static.colors is not None:
+                static.colors = [BLACK] * max(1, static.colors_min or 1)
+            dev.set_mode(static, force=True)
             dev.set_color(BLACK)
-            return
+            return {"mode": static.name, "black": True}
         raise RuntimeError("這個裝置不支援關燈模式")
+
+    def find_reverted(self, expectations):
+        """重新讀取裝置，找出被其他軟體改回來的裝置。expectations：{key: 預期結果}"""
+        with self.lock:
+            if not self.client:
+                return []
+            try:
+                self.client.update()
+            except Exception as e:  # noqa: BLE001
+                log(f"檢查時更新失敗：{e}")
+                return []
+            reverted = []
+            for dev in self.client.devices:
+                exp = expectations.get(self.key(dev))
+                if not exp:
+                    continue
+                now = dev.modes[dev.active_mode].name
+                changed = now.lower() != exp["mode"].lower()
+                if not changed and exp["black"]:
+                    changed = any(c.red or c.green or c.blue for c in dev.colors)
+                if changed:
+                    log(f"被改回：{dev.name} 預期 {exp['mode']}，實際 {now}")
+                    self.last_results[self.key(dev)] += f"（之後被改回 {now}）"
+                    reverted.append(dev.name)
+            return reverted
+
+    def devices_by_keys(self, keys):
+        with self.lock:
+            if not self.client:
+                return []
+            return [d for d in self.client.devices if self.key(d) in keys]
 
     @staticmethod
     def _saved_is_blank(saved):
@@ -524,7 +594,15 @@ class RGBController:
 
     def turn_on(self, dev, style="original"):
         with self.lock:
-            self._turn_on(dev, style)
+            before = dev.modes[dev.active_mode].name
+            try:
+                self._turn_on(dev, style)
+            except Exception as e:  # noqa: BLE001
+                log(f"恢復失敗 {dev.name}：{e}")
+                raise
+            after = dev.modes[dev.active_mode].name
+            log(f"恢復 {dev.name}：{before} → {after}")
+            self.last_results[self.key(dev)] = f"恢復 {before} → {after}"
 
     def _turn_on(self, dev, style="original"):
         """style：original（記錄的原本效果，沒有就彩虹）、rainbow、white、或 (r, g, b)"""
@@ -571,6 +649,9 @@ def cli_mode(turn_on):
                 STATE_FILE.write_text("{}", encoding="utf-8")
                 return
             style = "original"
+        if not turn_on and settings.get("auto_pause", True) and is_admin() and vendor_status():
+            pause_vendor()
+            time.sleep(2)
         devices = ctl.connect()
         for dev in devices:
             try:
@@ -763,7 +844,7 @@ def gui():
         "<MouseWheel>", lambda ev: canvas.yview_scroll(int(-ev.delta / 120), "units")))
     canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
-    def fill_devices(devices):
+    def fill_devices(devices, checked_keys=None):
         info["devices"] = list(devices or [])
         for w in inner.winfo_children():
             w.destroy()
@@ -782,7 +863,7 @@ def gui():
         order = list(TYPE_NAMES)
         devices = sorted(devices, key=lambda d: order.index(d.type.name) if d.type.name in order else 99)
         for dev in devices:
-            var = tk.BooleanVar(value=True)
+            var = tk.BooleanVar(value=checked_keys is None or ctl.key(dev) in checked_keys)
             row = ttk.Frame(inner)
             row.pack(fill="x", anchor="w", pady=2)
             ttk.Checkbutton(row, variable=var).pack(side="left")
@@ -842,7 +923,10 @@ def gui():
         if not targets:
             status_var.set("沒有勾選任何裝置")
             return
-        style_now = restore_style(settings) if turn_on else None
+        if not turn_on:
+            turn_off_flow({ctl.key(d) for d in targets}, auto_pause_var.get(), include_new=not only_selected)
+            return
+        style_now = restore_style(settings)
         if style_now == "vendor":
             handback_vendor(targets)
             return
@@ -850,12 +934,11 @@ def gui():
         def work():
             fails = []
             for i, dev in enumerate(targets, 1):
-                set_status(f"{'恢復' if turn_on else '關閉'}中… {i}/{len(targets)} {dev.name}")
+                set_status(f"恢復中… {i}/{len(targets)} {dev.name}")
                 try:
-                    ctl.turn_on(dev, style_now) if turn_on else ctl.turn_off(dev)
+                    ctl.turn_on(dev, style_now)
                 except Exception as e:  # noqa: BLE001
                     fails.append(f"{dev.name}：{e}")
-                    log(f"{dev.name}: {e}")
             return fails
 
         def done(fails):
@@ -864,7 +947,67 @@ def gui():
                 status_var.set(f"完成，但有 {len(fails)} 個裝置失敗")
                 messagebox.showwarning("部分裝置失敗", "\n".join(fails))
             else:
-                status_var.set(f"已{'恢復' if turn_on else '關閉'} {len(targets)} 個裝置的燈光")
+                status_var.set(f"已恢復 {len(targets)} 個裝置的燈光")
+        run_bg(work, done)
+
+    def turn_off_flow(keys, pause_first, include_new=False):
+        def work():
+            paused = False
+            if pause_first and is_admin() and vendor_status():
+                set_status("暫停原廠燈光軟體中…")
+                pause_vendor()
+                time.sleep(2)
+                ctl.rescan(set_status)  # 原廠軟體釋放裝置後重新偵測
+                paused = True
+            if include_new and ctl.client:
+                # 「全部關閉」：連暫停原廠軟體後才出現的裝置（例如滑鼠）也一起關
+                with ctl.lock:
+                    devs = list(ctl.client.devices)
+                keys.update(ctl.key(d) for d in devs)
+            else:
+                devs = ctl.devices_by_keys(keys)
+            expectations, fails = {}, []
+            for i, dev in enumerate(devs, 1):
+                set_status(f"關閉中… {i}/{len(devs)} {dev.name}")
+                try:
+                    expectations[ctl.key(dev)] = ctl.turn_off(dev)
+                except Exception as e:  # noqa: BLE001
+                    fails.append(f"{dev.name}：{e}")
+            set_status("確認燈光有沒有被其他軟體改回來…")
+            time.sleep(2.5)
+            reverted = ctl.find_reverted(expectations)
+            return {"paused": paused, "fails": fails, "reverted": reverted, "count": len(devs)}
+
+        def done(r):
+            if r["paused"]:
+                fill_devices(ctl.client.devices if ctl.client else [], keys)
+                refresh_vendor()
+            else:
+                update_labels()
+            if r["fails"]:
+                messagebox.showwarning("部分裝置失敗", "\n".join(r["fails"]))
+            if not r["reverted"]:
+                status_var.set(f"已關閉 {r['count'] - len(r['fails'])} 個裝置的燈光"
+                               + ("（已暫停原廠燈光軟體）" if r["paused"] else ""))
+                return
+            names = "\n".join("・" + n for n in r["reverted"])
+            status_var.set(f"有 {len(r['reverted'])} 個裝置的燈被其他軟體改回來了")
+            if not r["paused"] and info["vendors"] and is_admin():
+                if messagebox.askyesno(
+                        "燈被改回來了",
+                        f"下面的裝置關燈後，又被原廠燈光軟體改回來了：\n{names}\n\n"
+                        "要暫停原廠燈光軟體後自動重試嗎？\n（重新開機後原廠軟體會自動恢復）"):
+                    auto_pause_var.set(True)
+                    save_auto_pause()
+                    turn_off_flow(keys, True, include_new)
+            elif not is_admin():
+                messagebox.showinfo("燈被改回來了",
+                                    f"下面的裝置關燈後又被改回來了：\n{names}\n\n"
+                                    "請按「以系統管理員重新啟動」，再按一次關閉。")
+            else:
+                messagebox.showinfo("燈被改回來了",
+                                    f"下面的裝置關燈後又被改回來了：\n{names}\n\n"
+                                    "可能還有其他燈光程式在執行。\n請到「電腦配置」分頁按「複製診斷報告」，傳給幫忙的人。")
         run_bg(work, done)
 
     big = ttk.Frame(act)
@@ -926,8 +1069,16 @@ def gui():
         settings["keep_server"] = keep_var.get()
         save_json(SETTINGS_FILE, settings)
 
+    auto_pause_var = tk.BooleanVar(value=settings.get("auto_pause", True))
+
+    def save_auto_pause():
+        settings["auto_pause"] = auto_pause_var.get()
+        save_json(SETTINGS_FILE, settings)
+
+    ttk.Checkbutton(act, text="關燈時自動暫停原廠燈光軟體（建議開啟，否則燈可能被改回來）",
+                    variable=auto_pause_var, command=save_auto_pause).pack(anchor="w", pady=(6, 0))
     ttk.Checkbutton(act, text="關閉本程式後讓 OpenRGB 留在背景（燈光較不會被其他程式改回來）",
-                    variable=keep_var, command=save_keep).pack(anchor="w", pady=(6, 0))
+                    variable=keep_var, command=save_keep).pack(anchor="w")
 
     # ======== 電腦配置分頁 ========
     ttk.Label(hwtab, text="這台電腦的硬體與燈光相關資訊（自動偵測）", font=bold).pack(anchor="w")
@@ -954,11 +1105,33 @@ def gui():
         lines.append(f"可控制的燈光裝置（OpenRGB 偵測到 {len(info['devices'])} 個）：")
         for d in info["devices"]:
             try:
-                modes = "、".join(m.name for m in d.modes[:8])
+                modes = "、".join(m.name for m in d.modes[:10])
+                active = d.modes[d.active_mode].name
             except Exception:  # noqa: BLE001
-                modes = ""
-            lines.append(f"　・[{TYPE_NAMES.get(d.type.name, d.type.name)}] {d.name}（模式：{modes}）")
+                modes, active = "", "?"
+            lines.append(f"　・[{TYPE_NAMES.get(d.type.name, d.type.name)}] {d.name}")
+            lines.append(f"　　目前模式：{active}；可用模式：{modes}")
+            res = ctl.last_results.get(ctl.key(d))
+            if res:
+                lines.append(f"　　最近操作：{res}")
         lines.append("")
+        usb = hw.get("usb") or []
+        lines.append("USB 裝置代碼（用來查詢是否支援）：" + ("" if usb else "（無）"))
+        lines += [f"　・{x}" for x in usb]
+        lines.append("")
+        orgb_lines = openrgb_log_issues()
+        if orgb_lines:
+            lines.append("OpenRGB 回報的問題：")
+            lines += [f"　{x}" for x in orgb_lines]
+            lines.append("")
+        try:
+            tail = LOG_FILE.read_text(encoding="utf-8").splitlines()[-25:]
+        except OSError:
+            tail = []
+        if tail:
+            lines.append("最近的操作記錄：")
+            lines += [f"　{x}" for x in tail]
+            lines.append("")
         lines.append(f"系統管理員：{'是' if is_admin() else '否'}　PawnIO：{'已安裝' if pawnio_installed() else '未安裝'}"
                      f"　OpenRGB：{'有' if find_openrgb() else '無'}")
         return "\n".join(lines)
