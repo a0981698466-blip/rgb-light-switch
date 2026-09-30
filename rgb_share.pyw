@@ -36,6 +36,8 @@ SETTINGS_FILE = DATA_DIR / "settings.json"
 PAUSED_FILE = DATA_DIR / "paused_vendor.json"
 LOG_FILE = DATA_DIR / "rgb_control.log"
 ICON_FILE = RES_DIR / "lightbulb.ico"
+SAFE_LIST_FILE = RES_DIR / "peripheral_detectors.json"
+OPENRGB_CONFIG = Path(os.environ.get("APPDATA", Path.home())) / "OpenRGB" / "OpenRGB.json"
 
 OPENRGB_ZIP_URL = ("https://codeberg.org/OpenRGB/OpenRGB/releases/download/"
                    "release_1.0/OpenRGB_1.0_Windows_64_81bbe18.zip")
@@ -58,11 +60,11 @@ VENDORS = [
     {"brand": "ASUS Aura / Armoury Crate",
      "services": ["LightingService"],
      "processes": ["AacAmbientLighting", "LightingService"]},
-    {"brand": "Razer Chroma / Synapse",
+    {"brand": "Razer Chroma / Synapse", "peripheral": True,
      "services": ["Razer Chroma SDK Service", "Razer Chroma SDK Server", "Razer Chroma Stream Server"],
      "processes": ["RzChromaConnectManager", "RzChromaConnectServer", "RzChromaStreamServer",
                    "RzSmartlightingDeviceManager"]},
-    {"brand": "Logitech G HUB / LGS",
+    {"brand": "Logitech G HUB / LGS", "peripheral": True,
      "services": [],
      "processes": ["lghub_agent", "LCore"]},
     {"brand": "MSI Mystic Light / MSI Center",
@@ -74,10 +76,10 @@ VENDORS = [
     {"brand": "ASRock Polychrome",
      "services": [],
      "processes": ["AsrPolychromeRGB", "PolychromeRGB", "AsrLED"]},
-    {"brand": "Corsair iCUE",
+    {"brand": "Corsair iCUE", "peripheral": True,
      "services": ["CorsairService", "iCUEDevicePluginHost"],
      "processes": ["iCUE", "iCUEDevicePluginHost", "Corsair.Service"]},
-    {"brand": "SteelSeries GG",
+    {"brand": "SteelSeries GG", "peripheral": True,
      "services": [],
      "processes": ["SteelSeriesGG", "SteelSeriesGGClient", "SteelSeriesEngine"]},
     {"brand": "NZXT CAM",
@@ -86,7 +88,7 @@ VENDORS = [
     {"brand": "Lian Li L-Connect",
      "services": [],
      "processes": ["L-Connect 3", "L-Connect-Service"]},
-    {"brand": "HyperX NGENUITY",
+    {"brand": "HyperX NGENUITY", "peripheral": True,
      "services": [],
      "processes": ["NGENUITY", "NGenuity2"]},
     {"brand": "Cooler Master MasterPlus",
@@ -99,6 +101,15 @@ VENDORS = [
      "services": [],
      "processes": ["SignalRgb", "SignalRgbLauncher"]},
 ]
+
+# 安全模式：不讓 OpenRGB 偵測 / 控制鍵盤、滑鼠、耳機、音效裝置。
+# 這些裝置通常同時被原廠軟體（Synapse、G HUB、iCUE…）控制，兩邊搶控制權時
+# 可能造成裝置斷線重連（Windows 提示音）或鍵盤暫時無法輸入。
+PERIPHERAL_TYPES = {"KEYBOARD", "MOUSE", "MOUSEMAT", "HEADSET", "HEADSET_STAND", "GAMEPAD",
+                    "KEYPAD", "MICROPHONE", "SPEAKER"}
+PERIPH_DETECTOR_BRANDS = (r"Razer|Logitech|SteelSeries|HyperX|Roccat|Glorious|Wooting|Ducky|Redragon|Keychron|Cherry|Zowie|Genesis|Trust|Sinowealth|Endorfy|Mountain|Das Keyboard|EVision|Holtek|Alienware AW|Lenovo Legion M|MSI Vigor|MSI Clutch|Creative|Sound ?Blaster|Cooler Master (MK|MM|CK|SK|MH|MP)|Corsair (K\d|M\d|Harpoon|Ironclaw|Nightsword|Dark Core|Glaive|Katar|Sabre|Scimitar|Slipstream|Virtuoso|Void|HS\d|ST100|MM\d|Polaris|Strafe)|ASUS (ROG (Strix Scope|Claymore|Falchion|Azoth|Gladius|Chakram|Pugio|Keris|Spatha|Harpe|Strix Impact|Strix Evolve|Strix Carry|Strix Flare|Balteus|Sheath|Throne|Delta|Strix Go|Strix Fusion|Theta|Scabbard|Ryuo)|TUF Gaming (K|M|H|P)\d|Cerberus)")
+PERIPH_DETECTOR_WORDS = r"Keyboard|Mouse|Mousemat|Mouse Pad|Mousepad|Headset|Headphone|Keypad|Gamepad|\bMic\b|Microphone|Speaker|Soundbar|Audio|Laptop|Notebook|Blade"
+INTERNAL_DETECTOR_WORDS = (r"DRAM|Memory|Vengeance|Dominator|Fury|Trident|Motherboard|SMBus|GPU|GeForce|Radeon|RTX|GTX|RX \d|Commander|Lighting Node|Hydro|Capellix|iCUE LINK|Chroma ARGB|Addressable|Aura Core|Wraith|Fan|Pump|Strip|ARGB|Case")
 
 RAINBOW_NAMES = ["spectrum cycle", "rainbow wave", "rainbow", "spectrum", "wave",
                  "color cycle", "colour cycle", "cycle"]
@@ -336,11 +347,14 @@ def vendor_status(procs=None):
     return found
 
 
-def pause_vendor():
-    """停止各廠商燈光服務 / 程式，並記下來以便之後恢復"""
+def pause_vendor(safe=True):
+    """停止各廠商燈光服務 / 程式，並記下來以便之後恢復。
+    safe=True 時不碰鍵盤滑鼠類軟體（它們可能負責按鍵、巨集等功能）"""
     procs = process_table()
     paused = load_json(PAUSED_FILE, {"services": [], "processes": {}})
     for v in VENDORS:
+        if safe and v.get("peripheral"):
+            continue
         for s in v["services"]:
             if service_running(s):
                 run_quiet(["sc", "stop", s])
@@ -357,10 +371,10 @@ def pause_vendor():
     return paused
 
 
-def resume_vendor(restart=False):
+def resume_vendor(restart=False, safe=True):
     """重新啟動廠商燈光軟體；restart=True 會先停止再啟動，讓它們重新套用自己的燈光效果"""
     if restart:
-        pause_vendor()
+        pause_vendor(safe)
         time.sleep(3)
     paused = load_json(PAUSED_FILE, {"services": [], "processes": {}})
     for s in paused.get("services", []):
@@ -374,6 +388,115 @@ def resume_vendor(restart=False):
     PAUSED_FILE.unlink(missing_ok=True)
 
 
+# ---------------------------------------------------------------- OpenRGB 安全措施
+def is_peripheral_detector(name):
+    return bool((re.search(PERIPH_DETECTOR_BRANDS, name, re.I) or re.search(PERIPH_DETECTOR_WORDS, name, re.I))
+                and not re.search(INTERNAL_DETECTOR_WORDS, name, re.I))
+
+
+def apply_safe_mode(enabled):
+    """在 OpenRGB 設定檔中關閉（或重新開啟）鍵盤、滑鼠、耳機、音效裝置的偵測項目。
+    必須在 OpenRGB 啟動前呼叫。"""
+    cfg = load_json(OPENRGB_CONFIG, {})
+    detectors = cfg.setdefault("Detectors", {}).setdefault("detectors", {})
+    names = set(load_json(SAFE_LIST_FILE, {}).get("detectors", []))
+    names |= {n for n in detectors if is_peripheral_detector(n)}
+    want = not enabled
+    changed = False
+    for n in names:
+        if detectors.get(n) is not want:
+            detectors[n] = want
+            changed = True
+    if changed:
+        OPENRGB_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        save_json(OPENRGB_CONFIG, cfg)
+        log(f"安全模式{'開啟' if enabled else '關閉'}：已設定 {len(names)} 個周邊偵測項目")
+
+
+def kill_stale_openrgb():
+    """結束之前殘留在背景、由本程式啟動的 OpenRGB（例如程式當掉後留下的）"""
+    data = run_powershell_json(
+        "Get-CimInstance Win32_Process -Filter \"Name='OpenRGB.exe'\" | "
+        "Select-Object ProcessId,ExecutablePath | ConvertTo-Json -Compress")
+    if isinstance(data, dict):
+        data = [data]
+    ours = [str(OPENRGB_DIR).lower(), str(Path(sys.executable).parent / "OpenRGB").lower()]
+    killed = 0
+    for p in data or []:
+        path = (p.get("ExecutablePath") or "").lower()
+        if any(path.startswith(o) for o in ours):
+            run_quiet(["taskkill", "/f", "/pid", str(p.get("ProcessId"))])
+            killed += 1
+    if killed:
+        log(f"已結束 {killed} 個殘留的 OpenRGB")
+        for _ in range(20):
+            if not port_open():
+                break
+            time.sleep(0.25)
+    return killed
+
+
+class _KillOnCloseJob:
+    """把 OpenRGB 放進 Windows「工作物件」：本程式一結束（包括當掉、被強制關閉），
+    Windows 就會自動把 OpenRGB 一起結束，不會殘留在背景。"""
+
+    def __init__(self):
+        import ctypes.wintypes as wt
+        k32 = ctypes.windll.kernel32
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_ulonglong) for n in
+                        ("ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                         "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+        class BASIC(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong),
+                        ("PerJobUserTimeLimit", ctypes.c_longlong),
+                        ("LimitFlags", wt.DWORD),
+                        ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wt.DWORD),
+                        ("Affinity", ctypes.c_size_t),
+                        ("PriorityClass", wt.DWORD),
+                        ("SchedulingClass", wt.DWORD)]
+
+        class EXTENDED(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", BASIC),
+                        ("IoInfo", IO_COUNTERS),
+                        ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        k32.CreateJobObjectW.restype = wt.HANDLE
+        self.k32 = k32
+        self.job = k32.CreateJobObjectW(None, None)
+        info = EXTENDED()
+        info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        k32.SetInformationJobObject(wt.HANDLE(self.job), 9, ctypes.byref(info), ctypes.sizeof(info))
+
+    def add(self, proc):
+        import ctypes.wintypes as wt
+        ok = self.k32.AssignProcessToJobObject(wt.HANDLE(self.job), wt.HANDLE(int(proc._handle)))
+        if not ok:
+            log(f"無法綁定 OpenRGB 到工作物件（錯誤 {ctypes.GetLastError()}）")
+        return bool(ok)
+
+
+_JOB = None
+
+
+def kill_on_exit(proc):
+    global _JOB
+    try:
+        if _JOB is None:
+            _JOB = _KillOnCloseJob()
+        return _JOB.add(proc)
+    except Exception as e:  # noqa: BLE001
+        log(f"工作物件設定失敗：{e}")
+        return False
+
+
 # ---------------------------------------------------------------- 燈光控制核心
 class RGBController:
     def __init__(self):
@@ -382,6 +505,17 @@ class RGBController:
         self.state = load_json(STATE_FILE, {})
         self.lock = threading.RLock()
         self.last_results = {}  # 最近一次操作的結果，放進診斷報告
+        self.safe_mode = True
+
+    def visible_devices(self):
+        """可以控制的裝置（安全模式下排除鍵盤、滑鼠、耳機等）"""
+        with self.lock:
+            if not self.client:
+                return []
+            devs = list(self.client.devices)
+        if self.safe_mode:
+            devs = [d for d in devs if d.type.name not in PERIPHERAL_TYPES]
+        return devs
 
     def device_count(self):
         """重新讀取裝置清單並回傳數量"""
@@ -395,15 +529,21 @@ class RGBController:
             return len(self.client.devices)
 
     def start_server(self):
+        if self.server_proc and self.server_proc.poll() is None and port_open():
+            return True
+        kill_stale_openrgb()
         if port_open():
+            log("連接埠已被其他 OpenRGB 使用，改為連線到它（安全模式設定可能不會生效）")
             return True
         exe = find_openrgb()
         if not exe:
             raise RuntimeError("找不到 OpenRGB 控制核心，請先下載。")
+        apply_safe_mode(self.safe_mode)
         self.server_proc = subprocess.Popen([str(exe), "--server", "--server-port", str(PORT)],
                                             cwd=str(exe.parent), creationflags=CREATE_NO_WINDOW,
                                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                             stderr=subprocess.DEVNULL)
+        kill_on_exit(self.server_proc)
         for _ in range(60):
             if port_open():
                 return True
@@ -413,6 +553,10 @@ class RGBController:
     def stop_server(self):
         if self.server_proc and self.server_proc.poll() is None:
             self.server_proc.terminate()
+            try:
+                self.server_proc.wait(5)
+            except subprocess.TimeoutExpired:
+                pass
         self.server_proc = None
 
     def connect(self, status=None):
@@ -438,7 +582,7 @@ class RGBController:
             if stable >= 3 and (n > 0 or stable >= 8):
                 break
             time.sleep(0.5)
-        return self.client.devices
+        return self.visible_devices()
 
     def rescan(self, status=None):
         # 重新啟動 OpenRGB，讓它重新偵測硬體（例如暫停廠商軟體之後）
@@ -534,7 +678,7 @@ class RGBController:
                 log(f"檢查時更新失敗：{e}")
                 return []
             reverted = []
-            for dev in self.client.devices:
+            for dev in list(self.client.devices):
                 exp = expectations.get(self.key(dev))
                 if not exp:
                     continue
@@ -549,10 +693,7 @@ class RGBController:
             return reverted
 
     def devices_by_keys(self, keys):
-        with self.lock:
-            if not self.client:
-                return []
-            return [d for d in self.client.devices if self.key(d) in keys]
+        return [d for d in self.visible_devices() if self.key(d) in keys]
 
     @staticmethod
     def _saved_is_blank(saved):
@@ -641,16 +782,17 @@ def restore_style(settings):
 def cli_mode(turn_on):
     ctl = RGBController()
     settings = load_json(SETTINGS_FILE, {})
+    ctl.safe_mode = settings.get("safe_mode", True)
     try:
         style = restore_style(settings)
         if turn_on and style == "vendor":
             if is_admin():
-                resume_vendor(restart=True)
+                resume_vendor(restart=True, safe=ctl.safe_mode)
                 STATE_FILE.write_text("{}", encoding="utf-8")
                 return
             style = "original"
-        if not turn_on and settings.get("auto_pause", True) and is_admin() and vendor_status():
-            pause_vendor()
+        if not turn_on and settings.get("auto_pause_v2", False) and is_admin() and vendor_status():
+            pause_vendor(ctl.safe_mode)
             time.sleep(2)
         devices = ctl.connect()
         for dev in devices:
@@ -663,8 +805,7 @@ def cli_mode(turn_on):
         log(f"命令列模式失敗：{e}")
     finally:
         ctl.disconnect()
-        if not settings.get("keep_server"):
-            ctl.stop_server()
+        ctl.stop_server()
 
 
 # ---------------------------------------------------------------- 圖形介面
@@ -673,7 +814,8 @@ def gui():
     from tkinter import colorchooser, messagebox, ttk
 
     ctl = RGBController()
-    settings = load_json(SETTINGS_FILE, {"keep_server": False})
+    settings = load_json(SETTINGS_FILE, {})
+    ctl.safe_mode = settings.get("safe_mode", True)
     info = {"hw": None, "vendors": [], "devices": []}
 
     root = tk.Tk()
@@ -817,7 +959,7 @@ def gui():
                                    "（Corsair、NZXT、Lian Li 的軟體也控制風扇，暫停期間風扇會回到硬體預設轉速）\n\n"
                                    "要繼續嗎？"):
             return
-        run_bg(lambda: (pause_vendor(), time.sleep(2)),
+        run_bg(lambda: (pause_vendor(ctl.safe_mode), time.sleep(2)),
                lambda _: (status_var.set("已暫停原廠燈光軟體，重新偵測燈光裝置…"), refresh_vendor(), do_rescan()))
 
     def do_resume():
@@ -908,7 +1050,7 @@ def gui():
             for dev in targets:
                 ctl.state.pop(ctl.key(dev), None)
             ctl._save_state()
-            resume_vendor(restart=True)
+            resume_vendor(restart=True, safe=ctl.safe_mode)
             time.sleep(3)
             return ctl.connect(set_status)
 
@@ -955,14 +1097,13 @@ def gui():
             paused = False
             if pause_first and is_admin() and vendor_status():
                 set_status("暫停原廠燈光軟體中…")
-                pause_vendor()
+                pause_vendor(ctl.safe_mode)
                 time.sleep(2)
                 ctl.rescan(set_status)  # 原廠軟體釋放裝置後重新偵測
                 paused = True
             if include_new and ctl.client:
                 # 「全部關閉」：連暫停原廠軟體後才出現的裝置（例如滑鼠）也一起關
-                with ctl.lock:
-                    devs = list(ctl.client.devices)
+                devs = ctl.visible_devices()
                 keys.update(ctl.key(d) for d in devs)
             else:
                 devs = ctl.devices_by_keys(keys)
@@ -980,7 +1121,7 @@ def gui():
 
         def done(r):
             if r["paused"]:
-                fill_devices(ctl.client.devices if ctl.client else [], keys)
+                fill_devices(ctl.visible_devices(), keys)
                 refresh_vendor()
             else:
                 update_labels()
@@ -1063,22 +1204,30 @@ def gui():
     combo.bind("<<ComboboxSelected>>", on_style)
     show_color()
 
-    keep_var = tk.BooleanVar(value=settings.get("keep_server", False))
+    safe_var = tk.BooleanVar(value=ctl.safe_mode)
 
-    def save_keep():
-        settings["keep_server"] = keep_var.get()
+    def save_safe():
+        if not safe_var.get() and not messagebox.askyesno(
+                "關閉安全模式",
+                "關閉安全模式後，程式也會控制鍵盤、滑鼠、耳機的燈光。\n\n"
+                "但如果這些裝置同時被原廠軟體（Synapse、G HUB、iCUE 等）控制，\n"
+                "可能會發生裝置斷線、發出提示音、鍵盤暫時無法輸入的情況。\n\n確定要關閉嗎？"):
+            safe_var.set(True)
+            return
+        settings["safe_mode"] = ctl.safe_mode = safe_var.get()
         save_json(SETTINGS_FILE, settings)
+        do_rescan()
 
-    auto_pause_var = tk.BooleanVar(value=settings.get("auto_pause", True))
+    auto_pause_var = tk.BooleanVar(value=settings.get("auto_pause_v2", False))
 
     def save_auto_pause():
-        settings["auto_pause"] = auto_pause_var.get()
+        settings["auto_pause_v2"] = auto_pause_var.get()
         save_json(SETTINGS_FILE, settings)
 
-    ttk.Checkbutton(act, text="關燈時自動暫停原廠燈光軟體（建議開啟，否則燈可能被改回來）",
-                    variable=auto_pause_var, command=save_auto_pause).pack(anchor="w", pady=(6, 0))
-    ttk.Checkbutton(act, text="關閉本程式後讓 OpenRGB 留在背景（燈光較不會被其他程式改回來）",
-                    variable=keep_var, command=save_keep).pack(anchor="w")
+    ttk.Checkbutton(act, text="安全模式：不控制鍵盤、滑鼠、耳機（建議開啟，避免鍵盤斷線或失靈）",
+                    variable=safe_var, command=save_safe).pack(anchor="w", pady=(6, 0))
+    ttk.Checkbutton(act, text="關燈時自動暫停原廠燈光軟體（主機板等內部燈光；關閉本程式時會自動恢復）",
+                    variable=auto_pause_var, command=save_auto_pause).pack(anchor="w")
 
     # ======== 電腦配置分頁 ========
     ttk.Label(hwtab, text="這台電腦的硬體與燈光相關資訊（自動偵測）", font=bold).pack(anchor="w")
@@ -1208,14 +1357,14 @@ def gui():
                 return
 
             def work():
-                n = ctl.device_count()
-                root.after(0, after, n)
+                ctl.device_count()
+                root.after(0, after, len(ctl.visible_devices()))
 
             def after(n):
                 nonlocal known
                 if n != known and not busy["on"]:
                     known = n
-                    fill_devices(ctl.client.devices)
+                    fill_devices(ctl.visible_devices())
                     status_var.set(f"找到 {n} 個燈光裝置")
                 root.after(1500, tick)
             threading.Thread(target=work, daemon=True).start()
@@ -1223,11 +1372,31 @@ def gui():
 
     def on_close():
         ctl.disconnect()
-        if not keep_var.get():
-            ctl.stop_server()
+        ctl.stop_server()
+        if PAUSED_FILE.exists() and is_admin():
+            # 把這次暫停的原廠軟體恢復，避免關掉程式後原廠軟體一直停著
+            status_var.set("正在恢復原廠燈光軟體，請稍候…")
+            root.protocol("WM_DELETE_WINDOW", lambda: None)
+
+            def work():
+                try:
+                    resume_vendor()
+                finally:
+                    root.after(0, root.destroy)
+            threading.Thread(target=work, daemon=True).start()
+            return
         root.destroy()
 
+    def resume_leftover():
+        # 之前的版本暫停了原廠軟體卻沒有恢復：開啟時先恢復
+        if PAUSED_FILE.exists() and is_admin():
+            def work():
+                resume_vendor()
+                root.after(0, refresh_vendor)
+            threading.Thread(target=work, daemon=True).start()
+
     root.protocol("WM_DELETE_WINDOW", on_close)
+    resume_leftover()
     refresh_setup()
     refresh_vendor()
     do_detect_hw()
